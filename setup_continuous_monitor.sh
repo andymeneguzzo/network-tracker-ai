@@ -78,13 +78,21 @@ if [ ! -f "backend/network_monitor.py" ]; then
     exit 1
 fi
 
-# Test basic imports
+# Test basic imports using current working directory (FIX: No more __file__ issue!)
 echo ""
 echo "🧪 Testing basic imports..."
 python -c "
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'backend'))
+
+# Add backend directory to Python path using current working directory
+current_dir = os.getcwd()
+backend_path = os.path.join(current_dir, 'backend')
+sys.path.insert(0, backend_path)
+
+print(f'📁 Current directory: {current_dir}')
+print(f'📂 Backend path: {backend_path}')
+print(f'🔍 Backend exists: {os.path.exists(backend_path)}')
 
 try:
     from network_monitor import NetworkMonitor
@@ -105,6 +113,12 @@ print('✅ All imports successful!')
 
 if [ $? -ne 0 ]; then
     echo "❌ Import tests failed"
+    echo ""
+    echo "🔧 Debugging information:"
+    echo "📁 Current directory: $(pwd)"
+    echo "📂 Backend directory exists: $([ -d backend ] && echo 'Yes' || echo 'No')"
+    echo "📄 Files in backend:"
+    ls -la backend/ 2>/dev/null || echo "   (No files or directory doesn't exist)"
     exit 1
 fi
 
