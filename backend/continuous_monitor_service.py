@@ -4,7 +4,7 @@ Continuous Network Monitoring Service
 
 This service runs in the background and continuously monitors:
 1. Network usage (bandwidth)
-2. Number of connected devices  
+2. Number of connected devices
 3. Overall connection quality
 
 The service collects data every 1 second and displays real-time statistics
@@ -18,6 +18,7 @@ import threading
 import time
 import signal
 import sys
+import os
 from datetime import datetime
 from typing import Dict, List, Optional
 import statistics
@@ -43,7 +44,7 @@ class MonitoringSnapshot:
     avg_packet_loss: float
     overall_quality: str
     active_interfaces: List[str]
-    tested_device_ip: Optional[str] = None  # NEW: Track which device was tested
+    tested_device_ip: Optional[str] = None
 
 
 class ContinuousNetworkMonitorService:
@@ -86,13 +87,18 @@ class ContinuousNetworkMonitorService:
         self.last_device_discovery = None
         
         # Quality testing configuration
-        self.enable_quality_testing = monitor_interval >= 0.5  # Only test quality if interval is reasonable
-        self.quality_test_interval = max(5.0, monitor_interval * 5)  # Test quality less frequently
+        self.enable_quality_testing = monitor_interval >= 0.5
+        self.quality_test_interval = max(5.0, monitor_interval * 5)
         self.last_quality_test = None
         
-        # NEW: Round-robin device testing state
-        self.quality_test_device_index = 0  # Track which device to test next
-        self.last_tested_device_list = []   # Remember the device list from last quality test
+        # Round-robin device testing state
+        self.quality_test_device_index = 0
+        self.last_tested_device_list = []
+        
+        # FIX: Display management for clean output
+        self.last_display_length = 0
+        self.display_lock = threading.Lock()
+        self.suppress_quality_output = False  # Control quality test output
         
         # Register signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -103,6 +109,24 @@ class ContinuousNetworkMonitorService:
         print(f"\n🛑 Received signal {signum}, shutting down gracefully...")
         self.stop()
         sys.exit(0)
+    
+    def _clear_line(self):
+        """Clear the current terminal line completely."""
+        # Get terminal width or use default
+        try:
+            terminal_width = os.get_terminal_size().columns
+        except:
+            terminal_width = 80
+        
+        # Clear the line by overwriting with spaces, then return to start
+        print('\r' + ' ' * terminal_width + '\r', end='', flush=True)
+    
+    def _print_quality_message(self, message: str):
+        """Print quality testing message without interfering with real-time display."""
+        if not self.suppress_quality_output:
+            with self.display_lock:
+                self._clear_line()
+                print(f"\n{message}")
     
     def start(self) -> bool:
         """
@@ -157,7 +181,7 @@ class ContinuousNetworkMonitorService:
         print("\n📊 Real-time Monitoring Started:")
         print("-" * 80)
         
-        # Wait a moment for first measurement to ensure status check passes
+        # Wait a moment for first measurement
         time.sleep(0.1)
         
         return True
@@ -173,7 +197,10 @@ class ContinuousNetworkMonitorService:
             print("⚠️  Service is not running!")
             return False
         
-        print("\n🛑 Stopping monitoring service...")
+        # FIX: Clean display before stopping
+        with self.display_lock:
+            self._clear_line()
+            print("\n🛑 Stopping monitoring service...")
         
         # Signal shutdown
         self.is_running = False
@@ -219,17 +246,21 @@ class ContinuousNetworkMonitorService:
                     
                     self.successful_measurements += 1
                 else:
-                    print(f"⚠️  Failed to collect snapshot at {datetime.now().strftime('%H:%M:%S')}")
+                    with self.display_lock:
+                        self._clear_line()
+                        print(f"\n⚠️  Failed to collect snapshot at {datetime.now().strftime('%H:%M:%S')}")
                 
                 self.measurement_count += 1
                 
             except Exception as e:
-                print(f"❌ Error in monitoring loop: {e}")
+                with self.display_lock:
+                    self._clear_line()
+                    print(f"\n❌ Error in monitoring loop: {e}")
                 self.measurement_count += 1
             
             # Calculate exact sleep time and ensure minimum interval
             loop_duration = time.time() - loop_start_time
-            sleep_time = max(0.05, self.monitor_interval - loop_duration)  # Minimum 50ms sleep
+            sleep_time = max(0.05, self.monitor_interval - loop_duration)
             
             # Use shutdown event for interruptible sleep
             if sleep_time > 0:
@@ -262,7 +293,7 @@ class ContinuousNetworkMonitorService:
         
         # If device list changed, reset to first device
         if current_ips != last_ips:
-            print(f"\n🔄 Device list changed, resetting round-robin to first device")
+            self._print_quality_message("🔄 Device list changed, resetting round-robin to first device")
             self.quality_test_device_index = 0
             self.last_tested_device_list = sorted_devices.copy()
         
@@ -341,8 +372,8 @@ class ContinuousNetworkMonitorService:
                 
                 if device_to_test:
                     try:
-                        print(f"\n🔍 Round-robin testing device: {device_to_test['ip']} "
-                              f"({device_to_test.get('hostname', 'Unknown')})")
+                        # FIX: Suppress detailed output during testing to keep display clean
+                        self.suppress_quality_output = True
                         
                         # Quick quality check (only 1 ping sample for speed)
                         quality = self.network_monitor.monitor_device_connectivity(
@@ -354,12 +385,18 @@ class ContinuousNetworkMonitorService:
                         tested_device_ip = device_to_test['ip']
                         self.last_quality_test = current_time
                         
-                        print(f"   📊 Results: {avg_latency:.1f}ms latency, {avg_packet_loss:.1f}% loss")
+                        # FIX: Brief, clean notification without disrupting display
+                        hostname = device_to_test.get('hostname', 'Unknown')
+                        self._print_quality_message(
+                            f"🔍 Tested {device_to_test['ip']} ({hostname}): "
+                            f"{avg_latency:.1f}ms, {avg_packet_loss:.1f}% loss"
+                        )
                         
                     except Exception as e:
-                        print(f"   ⚠️ Quality test failed for {device_to_test['ip']}: {e}")
-                        # Move to next device anyway
+                        # Move to next device anyway, but don't spam errors
                         pass
+                    finally:
+                        self.suppress_quality_output = False
                 
                 # Determine overall quality based on tested device
                 overall_quality = self._calculate_overall_quality(avg_latency, avg_packet_loss, len(devices))
@@ -423,28 +460,37 @@ class ContinuousNetworkMonitorService:
         """
         Display real-time monitoring data in a formatted terminal output.
         
-        Enhanced to show which device was tested in round-robin.
+        FIX: Clean, non-overlapping display with proper line management.
         """
-        # Calculate uptime
-        uptime = datetime.now() - self.start_time
-        uptime_str = str(uptime).split('.')[0]  # Remove microseconds
-        
-        # Calculate success rate
-        success_rate = (self.successful_measurements / self.measurement_count * 100) if self.measurement_count > 0 else 0
-        
-        # Enhanced display with tested device info
-        tested_info = f" [Testing: {snapshot.tested_device_ip}]" if snapshot.tested_device_ip else ""
-        
-        # Clear the previous line and display current stats
-        print(f"\r📊 {snapshot.timestamp.strftime('%H:%M:%S')} | "
-              f"Devices: {snapshot.device_count:2d} | "
-              f"↑{snapshot.total_upload_mbps:6.2f} Mbps | "
-              f"↓{snapshot.total_download_mbps:6.2f} Mbps | "
-              f"Quality: {snapshot.overall_quality:9s} | "
-              f"Latency: {snapshot.avg_latency_ms:5.1f}ms | "
-              f"Loss: {snapshot.avg_packet_loss:4.1f}% | "
-              f"Uptime: {uptime_str} | "
-              f"Success: {success_rate:5.1f}%{tested_info}", end="", flush=True)
+        with self.display_lock:
+            # Calculate uptime
+            uptime = datetime.now() - self.start_time
+            uptime_str = str(uptime).split('.')[0]  # Remove microseconds
+            
+            # Calculate success rate
+            success_rate = (self.successful_measurements / self.measurement_count * 100) if self.measurement_count > 0 else 0
+            
+            # Build the status line
+            tested_info = f" [Testing: {snapshot.tested_device_ip}]" if snapshot.tested_device_ip else ""
+            
+            status_line = (
+                f"📊 {snapshot.timestamp.strftime('%H:%M:%S')} | "
+                f"Devices: {snapshot.device_count:2d} | "
+                f"↑{snapshot.total_upload_mbps:6.2f} Mbps | "
+                f"↓{snapshot.total_download_mbps:6.2f} Mbps | "
+                f"Quality: {snapshot.overall_quality:9s} | "
+                f"Latency: {snapshot.avg_latency_ms:5.1f}ms | "
+                f"Loss: {snapshot.avg_packet_loss:4.1f}% | "
+                f"Uptime: {uptime_str} | "
+                f"Success: {success_rate:5.1f}%{tested_info}"
+            )
+            
+            # Clear the line completely and display new status
+            self._clear_line()
+            print(status_line, end='', flush=True)
+            
+            # Store the length for future clearing
+            self.last_display_length = len(status_line)
     
     def _print_final_stats(self):
         """Print final statistics when service stops."""
@@ -464,7 +510,7 @@ class ContinuousNetworkMonitorService:
         latencies = [s.avg_latency_ms for s in self.snapshots if s.avg_latency_ms > 0]
         avg_latency = statistics.mean(latencies) if latencies else 0
         
-        # NEW: Round-robin testing summary
+        # Round-robin testing summary
         tested_devices = set(s.tested_device_ip for s in self.snapshots if s.tested_device_ip)
         
         print(f"\n\n📈 Final Session Statistics:")
