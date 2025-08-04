@@ -4,7 +4,7 @@ Continuous Network Monitoring Service
 
 This service runs in the background and continuously monitors:
 1. Network usage (bandwidth)
-2. Number of connected devices
+2. Number of connected devices  
 3. Overall connection quality
 
 The service collects data every 1 second and displays real-time statistics
@@ -43,6 +43,7 @@ class MonitoringSnapshot:
     avg_packet_loss: float
     overall_quality: str
     active_interfaces: List[str]
+    tested_device_ip: Optional[str] = None  # NEW: Track which device was tested
 
 
 class ContinuousNetworkMonitorService:
@@ -55,6 +56,7 @@ class ContinuousNetworkMonitorService:
     3. Real-time data collection and processing
     4. Service-oriented architecture
     5. Data pipeline design
+    6. Round-robin device testing for comprehensive coverage
     """
     
     def __init__(self, monitor_interval: float = 1.0):
@@ -83,6 +85,15 @@ class ContinuousNetworkMonitorService:
         self.start_time = None
         self.last_device_discovery = None
         
+        # Quality testing configuration
+        self.enable_quality_testing = monitor_interval >= 0.5  # Only test quality if interval is reasonable
+        self.quality_test_interval = max(5.0, monitor_interval * 5)  # Test quality less frequently
+        self.last_quality_test = None
+        
+        # NEW: Round-robin device testing state
+        self.quality_test_device_index = 0  # Track which device to test next
+        self.last_tested_device_list = []   # Remember the device list from last quality test
+        
         # Register signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -109,6 +120,7 @@ class ContinuousNetworkMonitorService:
         print(f"📡 Network range: {self.network_monitor.network_range}")
         print(f"⏱️  Monitoring interval: {self.monitor_interval} seconds")
         print(f"💾 Data will be displayed in real-time terminal output")
+        print(f"🔍 Connection quality testing: {'Enabled (Round-Robin)' if self.enable_quality_testing else 'Disabled (fast mode)'}")
         print("🛑 Press Ctrl+C to stop monitoring")
         print("="*60)
         
@@ -128,6 +140,7 @@ class ContinuousNetworkMonitorService:
         except Exception as e:
             print(f"⚠️  Initial device discovery failed: {e}")
             self.device_cache = {}
+            self.last_device_discovery = time.time()
         
         # Get initial bandwidth stats
         try:
@@ -143,6 +156,9 @@ class ContinuousNetworkMonitorService:
         
         print("\n📊 Real-time Monitoring Started:")
         print("-" * 80)
+        
+        # Wait a moment for first measurement to ensure status check passes
+        time.sleep(0.1)
         
         return True
     
@@ -211,17 +227,62 @@ class ContinuousNetworkMonitorService:
                 print(f"❌ Error in monitoring loop: {e}")
                 self.measurement_count += 1
             
-            # Calculate sleep time to maintain consistent interval
+            # Calculate exact sleep time and ensure minimum interval
             loop_duration = time.time() - loop_start_time
-            sleep_time = max(0, self.monitor_interval - loop_duration)
+            sleep_time = max(0.05, self.monitor_interval - loop_duration)  # Minimum 50ms sleep
             
             # Use shutdown event for interruptible sleep
             if sleep_time > 0:
                 self.shutdown_event.wait(sleep_time)
     
+    def _get_next_device_for_quality_test(self, devices: List[Dict]) -> Optional[Dict]:
+        """
+        Get the next device for quality testing using round-robin approach.
+        
+        This function implements round-robin device selection:
+        1. If device list changed, reset to first device
+        2. Otherwise, move to next device in sequence
+        3. Wrap around to beginning when we reach the end
+        
+        Args:
+            devices: Current list of discovered devices
+            
+        Returns:
+            Device dictionary to test, or None if no devices available
+        """
+        if not devices:
+            return None
+        
+        # Create a stable device list sorted by IP for consistent ordering
+        sorted_devices = sorted(devices, key=lambda d: d['ip'])
+        
+        # Check if device list has changed significantly
+        current_ips = [d['ip'] for d in sorted_devices]
+        last_ips = [d['ip'] for d in self.last_tested_device_list]
+        
+        # If device list changed, reset to first device
+        if current_ips != last_ips:
+            print(f"\n🔄 Device list changed, resetting round-robin to first device")
+            self.quality_test_device_index = 0
+            self.last_tested_device_list = sorted_devices.copy()
+        
+        # Ensure index is within bounds (safety check)
+        if self.quality_test_device_index >= len(sorted_devices):
+            self.quality_test_device_index = 0
+        
+        # Get the device to test
+        device_to_test = sorted_devices[self.quality_test_device_index]
+        
+        # Move to next device for next time (round-robin)
+        self.quality_test_device_index = (self.quality_test_device_index + 1) % len(sorted_devices)
+        
+        return device_to_test
+    
     def _collect_snapshot(self) -> Optional[MonitoringSnapshot]:
         """
         Collect a complete network monitoring snapshot.
+        
+        Enhanced with round-robin device quality testing.
         
         Returns:
             MonitoringSnapshot: Complete network state, or None if collection failed
@@ -244,7 +305,7 @@ class ContinuousNetworkMonitorService:
             else:
                 devices = list(self.device_cache.values())
             
-            # 2. Get current bandwidth statistics
+            # 2. Get current bandwidth statistics (this is fast)
             current_bandwidth_stats = self.network_monitor.get_bandwidth_stats()
             
             # 3. Calculate bandwidth usage (if we have previous stats)
@@ -264,31 +325,50 @@ class ContinuousNetworkMonitorService:
             # Update bandwidth baseline
             self.last_bandwidth_stats = current_bandwidth_stats
             
-            # 4. Calculate connection quality (sample 2 devices max for performance)
-            latencies = []
-            packet_losses = []
+            # 4. ENHANCED: Round-robin connection quality testing
+            avg_latency = 0.0
+            avg_packet_loss = 0.0
+            overall_quality = "Unknown"
+            tested_device_ip = None
             
-            sample_devices = devices[:2] if devices else []
-            for device in sample_devices:
-                try:
-                    # Quick quality check (only 2 ping samples for speed)
-                    quality = self.network_monitor.monitor_device_connectivity(
-                        device['ip'], samples=2
-                    )
-                    latencies.append(quality['avg_latency_ms'])
-                    packet_losses.append(quality['packet_loss_percent'])
-                except Exception:
-                    # Skip devices that can't be reached quickly
-                    continue
+            # Only test quality if enabled and enough time has passed
+            if (self.enable_quality_testing and 
+                (self.last_quality_test is None or 
+                 current_time - self.last_quality_test > self.quality_test_interval)):
+                
+                # Get next device using round-robin
+                device_to_test = self._get_next_device_for_quality_test(devices)
+                
+                if device_to_test:
+                    try:
+                        print(f"\n🔍 Round-robin testing device: {device_to_test['ip']} "
+                              f"({device_to_test.get('hostname', 'Unknown')})")
+                        
+                        # Quick quality check (only 1 ping sample for speed)
+                        quality = self.network_monitor.monitor_device_connectivity(
+                            device_to_test['ip'], samples=1
+                        )
+                        
+                        avg_latency = quality['avg_latency_ms']
+                        avg_packet_loss = quality['packet_loss_percent']
+                        tested_device_ip = device_to_test['ip']
+                        self.last_quality_test = current_time
+                        
+                        print(f"   📊 Results: {avg_latency:.1f}ms latency, {avg_packet_loss:.1f}% loss")
+                        
+                    except Exception as e:
+                        print(f"   ⚠️ Quality test failed for {device_to_test['ip']}: {e}")
+                        # Move to next device anyway
+                        pass
+                
+                # Determine overall quality based on tested device
+                overall_quality = self._calculate_overall_quality(avg_latency, avg_packet_loss, len(devices))
+            else:
+                # Use cached quality or basic estimation when not testing
+                if devices:
+                    overall_quality = "Good" if len(devices) <= 10 else "Fair"
             
-            # Calculate averages
-            avg_latency = statistics.mean(latencies) if latencies else 0.0
-            avg_packet_loss = statistics.mean(packet_losses) if packet_losses else 0.0
-            
-            # Determine overall quality
-            overall_quality = self._calculate_overall_quality(avg_latency, avg_packet_loss, len(devices))
-            
-            # 5. Create snapshot
+            # 5. Create snapshot with enhanced information
             snapshot = MonitoringSnapshot(
                 timestamp=snapshot_timestamp,
                 device_count=len(devices),
@@ -299,7 +379,8 @@ class ContinuousNetworkMonitorService:
                 avg_latency_ms=round(avg_latency, 2),
                 avg_packet_loss=round(avg_packet_loss, 2),
                 overall_quality=overall_quality,
-                active_interfaces=current_bandwidth_stats.get('interfaces', [])
+                active_interfaces=current_bandwidth_stats.get('interfaces', []),
+                tested_device_ip=tested_device_ip
             )
             
             return snapshot
@@ -342,7 +423,7 @@ class ContinuousNetworkMonitorService:
         """
         Display real-time monitoring data in a formatted terminal output.
         
-        This creates a user-friendly dashboard that updates every second.
+        Enhanced to show which device was tested in round-robin.
         """
         # Calculate uptime
         uptime = datetime.now() - self.start_time
@@ -350,6 +431,9 @@ class ContinuousNetworkMonitorService:
         
         # Calculate success rate
         success_rate = (self.successful_measurements / self.measurement_count * 100) if self.measurement_count > 0 else 0
+        
+        # Enhanced display with tested device info
+        tested_info = f" [Testing: {snapshot.tested_device_ip}]" if snapshot.tested_device_ip else ""
         
         # Clear the previous line and display current stats
         print(f"\r📊 {snapshot.timestamp.strftime('%H:%M:%S')} | "
@@ -360,7 +444,7 @@ class ContinuousNetworkMonitorService:
               f"Latency: {snapshot.avg_latency_ms:5.1f}ms | "
               f"Loss: {snapshot.avg_packet_loss:4.1f}% | "
               f"Uptime: {uptime_str} | "
-              f"Success: {success_rate:5.1f}%", end="", flush=True)
+              f"Success: {success_rate:5.1f}%{tested_info}", end="", flush=True)
     
     def _print_final_stats(self):
         """Print final statistics when service stops."""
@@ -380,6 +464,9 @@ class ContinuousNetworkMonitorService:
         latencies = [s.avg_latency_ms for s in self.snapshots if s.avg_latency_ms > 0]
         avg_latency = statistics.mean(latencies) if latencies else 0
         
+        # NEW: Round-robin testing summary
+        tested_devices = set(s.tested_device_ip for s in self.snapshots if s.tested_device_ip)
+        
         print(f"\n\n📈 Final Session Statistics:")
         print("="*50)
         print(f"⏱️  Total runtime: {str(total_runtime).split('.')[0]}")
@@ -390,8 +477,14 @@ class ContinuousNetworkMonitorService:
         print(f"⬆️  Total upload activity: {total_upload:.2f} Mbps-seconds")
         print(f"⬇️  Total download activity: {total_download:.2f} Mbps-seconds")
         print(f"🔍 Average network latency: {avg_latency:.1f}ms")
+        print(f"🎯 Unique devices tested: {len(tested_devices)} devices")
         print(f"💾 Data snapshots collected: {len(self.snapshots)}")
         print(f"🗄️  Ready for database persistence!")
+        
+        if tested_devices:
+            print(f"\n🔄 Round-robin tested devices:")
+            for ip in sorted(tested_devices):
+                print(f"   • {ip}")
     
     def get_recent_snapshots(self, count: int = 10) -> List[MonitoringSnapshot]:
         """
@@ -420,7 +513,10 @@ class ContinuousNetworkMonitorService:
             'success_rate': (self.successful_measurements / self.measurement_count * 100) if self.measurement_count > 0 else 0,
             'snapshots_collected': len(self.snapshots),
             'network_range': self.network_monitor.network_range,
-            'monitor_interval': self.monitor_interval
+            'monitor_interval': self.monitor_interval,
+            'quality_testing_enabled': self.enable_quality_testing,
+            'current_device_index': self.quality_test_device_index,
+            'devices_in_rotation': len(self.last_tested_device_list)
         }
 
 
@@ -430,7 +526,7 @@ def main():
     
     This provides a simple CLI interface to start the service.
     """
-    print("🌐 Continuous Network Monitoring Service")
+    print("🌐 Continuous Network Monitoring Service (Round-Robin Enhanced)")
     print("=" * 50)
     
     # Create and start the service
