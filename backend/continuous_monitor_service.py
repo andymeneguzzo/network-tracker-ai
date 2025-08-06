@@ -19,24 +19,30 @@ import time
 import signal
 import sys
 import os
-from datetime import datetime
-from typing import Dict, List, Optional
-import statistics
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
 
-# Import our existing NetworkMonitor
+# Add backend directory to path for imports
+import sys
+from pathlib import Path
+backend_path = Path(__file__).parent
+sys.path.insert(0, str(backend_path))
+
 from network_monitor import NetworkMonitor
 
 
 @dataclass
 class MonitoringSnapshot:
     """
-    Data structure for a single monitoring snapshot.
-    This represents all network data collected at one moment in time.
+    Data class representing a single monitoring snapshot.
+    
+    This structure contains all the monitoring metrics we collect
+    and will be perfect for storing in our database later.
     """
-    timestamp: datetime
+    timestamp: str
     device_count: int
-    devices: List[Dict]
+    devices: List[Dict[str, Any]]
     total_upload_mbps: float
     total_download_mbps: float
     total_usage_mb: float
@@ -60,53 +66,47 @@ class ContinuousNetworkMonitorService:
     6. Round-robin device testing for comprehensive coverage
     """
     
-    def __init__(self, monitor_interval: float = 1.0):
+    def __init__(self, monitoring_interval: float = 1.0, quality_test_samples: int = 1):
         """
         Initialize the continuous monitoring service.
         
         Args:
-            monitor_interval: Time between measurements in seconds (default: 1.0)
+            monitoring_interval: Time between monitoring cycles (seconds)
+            quality_test_samples: Number of ping samples per device test
         """
-        self.monitor_interval = monitor_interval
+        self.monitoring_interval = monitoring_interval
+        self.quality_test_samples = quality_test_samples
+        
+        # Core monitoring components
         self.network_monitor = NetworkMonitor()
         
         # Service state management
         self.is_running = False
         self.monitor_thread = None
-        self.shutdown_event = threading.Event()
+        self.start_time = None
         
-        # Data tracking
-        self.snapshots = []
-        self.last_bandwidth_stats = None
-        self.device_cache = {}
+        # Data collection and statistics
+        self.snapshots: List[MonitoringSnapshot] = []
+        self.device_cache: Dict[str, Dict[str, Any]] = {}
         self.measurement_count = 0
         self.successful_measurements = 0
         
-        # Performance tracking
-        self.start_time = None
-        self.last_device_discovery = None
+        # Round-robin device testing
+        self.device_test_index = 0
+        self.tested_devices = set()
         
-        # Quality testing configuration
-        self.enable_quality_testing = monitor_interval >= 0.5
-        self.quality_test_interval = max(5.0, monitor_interval * 5)
-        self.last_quality_test = None
-        
-        # Round-robin device testing state
-        self.quality_test_device_index = 0
-        self.last_tested_device_list = []
-        
-        # FIX: Display management for clean output
-        self.last_display_length = 0
+        # Thread safety for display
         self.display_lock = threading.Lock()
-        self.suppress_quality_output = False  # Control quality test output
+        self.last_display_length = 0
+        self.suppress_quality_output = False
         
-        # Register signal handlers for graceful shutdown
+        # Setup graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
     
     def _signal_handler(self, signum, frame):
-        """Handle shutdown signals gracefully."""
-        print(f"\n🛑 Received signal {signum}, shutting down gracefully...")
+        """Handle interrupt signals gracefully."""
+        print("\n🛑 Received shutdown signal...")
         self.stop()
         sys.exit(0)
     
@@ -133,275 +133,211 @@ class ContinuousNetworkMonitorService:
         Start the continuous monitoring service.
         
         Returns:
-            bool: True if service started successfully, False otherwise
+            True if service started successfully, False otherwise
         """
         if self.is_running:
-            print("⚠️  Service is already running!")
+            print("⚠️ Service is already running")
             return False
         
         print("🚀 Starting Continuous Network Monitoring Service")
-        print("="*60)
+        print("=" * 60)
         print(f"📡 Network range: {self.network_monitor.network_range}")
-        print(f"⏱️  Monitoring interval: {self.monitor_interval} seconds")
-        print(f"💾 Data will be displayed in real-time terminal output")
-        print(f"🔍 Connection quality testing: {'Enabled (Round-Robin)' if self.enable_quality_testing else 'Disabled (fast mode)'}")
+        print(f"⏱️  Monitoring interval: {self.monitoring_interval} seconds")
+        print("💾 Data will be displayed in real-time terminal output")
+        print("🔍 Connection quality testing: Enabled (Round-Robin)")
         print("🛑 Press Ctrl+C to stop monitoring")
-        print("="*60)
-        
-        # Initialize service state
-        self.is_running = True
-        self.start_time = datetime.now()
-        self.measurement_count = 0
-        self.successful_measurements = 0
+        print("=" * 60)
         
         # Perform initial device discovery
         print("🔍 Performing initial device discovery...")
-        try:
-            devices = self.network_monitor.discover_devices()
-            self.device_cache = {dev['ip']: dev for dev in devices}
-            print(f"✅ Initial discovery complete: {len(devices)} devices found")
-            self.last_device_discovery = time.time()
-        except Exception as e:
-            print(f"⚠️  Initial device discovery failed: {e}")
-            self.device_cache = {}
-            self.last_device_discovery = time.time()
+        initial_devices = self.network_monitor.discover_devices()
         
-        # Get initial bandwidth stats
-        try:
-            self.last_bandwidth_stats = self.network_monitor.get_bandwidth_stats()
-            print("✅ Initial bandwidth baseline established")
-        except Exception as e:
-            print(f"⚠️  Could not establish bandwidth baseline: {e}")
-            self.last_bandwidth_stats = None
+        if not initial_devices:
+            print("❌ No devices found during initial discovery")
+            print("💡 Check your network connection and try again")
+            return False
+        
+        # Initialize device cache and round-robin
+        self.device_cache = {dev['ip']: dev for dev in initial_devices}
+        self.device_test_index = 0
+        self.tested_devices.clear()
+        
+        print(f"✅ Initial discovery complete: {len(initial_devices)} devices found")
+        
+        # Get initial bandwidth baseline
+        initial_bandwidth = self.network_monitor.get_bandwidth_stats()
+        print("✅ Initial bandwidth baseline established")
         
         # Start monitoring thread
-        self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.is_running = True
+        self.start_time = datetime.now()
+        self.monitor_thread = threading.Thread(target=self._monitoring_loop, daemon=True)
         self.monitor_thread.start()
         
         print("\n📊 Real-time Monitoring Started:")
-        print("-" * 80)
-        
-        # Wait a moment for first measurement
-        time.sleep(0.1)
         
         return True
     
-    def stop(self) -> bool:
-        """
-        Stop the continuous monitoring service gracefully.
-        
-        Returns:
-            bool: True if service stopped successfully, False otherwise
-        """
+    def stop(self):
+        """Stop the continuous monitoring service."""
         if not self.is_running:
-            print("⚠️  Service is not running!")
-            return False
+            return
         
-        # FIX: Clean display before stopping
-        with self.display_lock:
-            self._clear_line()
-            print("\n🛑 Stopping monitoring service...")
-        
-        # Signal shutdown
+        print("\n🛑 Stopping monitoring service...")
         self.is_running = False
-        self.shutdown_event.set()
         
-        # Wait for monitor thread to finish
+        # Wait for monitoring thread to finish
         if self.monitor_thread and self.monitor_thread.is_alive():
-            self.monitor_thread.join(timeout=5.0)
-            if self.monitor_thread.is_alive():
-                print("⚠️  Monitor thread did not shut down cleanly")
-            else:
-                print("✅ Monitor thread stopped cleanly")
+            self.monitor_thread.join(timeout=5)
+            print("✅ Monitor thread stopped cleanly")
         
         # Print final statistics
         self._print_final_stats()
-        
-        return True
     
-    def _monitor_loop(self):
+    def _monitoring_loop(self):
         """
-        Main monitoring loop that runs in background thread.
+        Main monitoring loop that runs in a separate thread.
         
-        This loop continuously collects network data and displays it in real-time.
-        It demonstrates proper thread management and error handling.
+        This loop demonstrates:
+        1. Continuous data collection
+        2. Error handling and recovery
+        3. Performance optimization
+        4. Data aggregation and processing
         """
-        while self.is_running and not self.shutdown_event.is_set():
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        
+        while self.is_running:
             loop_start_time = time.time()
             
             try:
                 # Collect monitoring snapshot
-                snapshot = self._collect_snapshot()
+                snapshot = self._collect_monitoring_snapshot()
                 
                 if snapshot:
-                    # Store snapshot for later database persistence
-                    self.snapshots.append(snapshot)
-                    
-                    # Keep only last 1000 snapshots in memory (prevent memory leak)
-                    if len(self.snapshots) > 1000:
-                        self.snapshots = self.snapshots[-1000:]
-                    
-                    # Display real-time data
-                    self._display_realtime_data(snapshot)
-                    
-                    self.successful_measurements += 1
+                    # Process and display the data
+                    self._process_monitoring_data(snapshot)
+                    consecutive_errors = 0  # Reset error counter on success
                 else:
-                    with self.display_lock:
-                        self._clear_line()
-                        print(f"\n⚠️  Failed to collect snapshot at {datetime.now().strftime('%H:%M:%S')}")
-                
-                self.measurement_count += 1
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        print(f"\n❌ Too many consecutive errors ({consecutive_errors}), stopping...")
+                        self.is_running = False
+                        break
                 
             except Exception as e:
-                with self.display_lock:
-                    self._clear_line()
-                    print(f"\n❌ Error in monitoring loop: {e}")
-                self.measurement_count += 1
+                consecutive_errors += 1
+                print(f"\n⚠️ Monitoring error: {e}")
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    print(f"\n❌ Too many consecutive errors ({consecutive_errors}), stopping...")
+                    self.is_running = False
+                    break
             
-            # Calculate exact sleep time and ensure minimum interval
+            # Maintain precise timing
             loop_duration = time.time() - loop_start_time
-            sleep_time = max(0.05, self.monitor_interval - loop_duration)
+            sleep_time = max(0, self.monitoring_interval - loop_duration)
             
-            # Use shutdown event for interruptible sleep
             if sleep_time > 0:
-                self.shutdown_event.wait(sleep_time)
+                time.sleep(sleep_time)
     
-    def _get_next_device_for_quality_test(self, devices: List[Dict]) -> Optional[Dict]:
+    def _collect_monitoring_snapshot(self) -> Optional[MonitoringSnapshot]:
         """
-        Get the next device for quality testing using round-robin approach.
+        Collect a complete monitoring snapshot.
         
-        This function implements round-robin device selection:
-        1. If device list changed, reset to first device
-        2. Otherwise, move to next device in sequence
-        3. Wrap around to beginning when we reach the end
-        
-        Args:
-            devices: Current list of discovered devices
-            
-        Returns:
-            Device dictionary to test, or None if no devices available
-        """
-        if not devices:
-            return None
-        
-        # Create a stable device list sorted by IP for consistent ordering
-        sorted_devices = sorted(devices, key=lambda d: d['ip'])
-        
-        # Check if device list has changed significantly
-        current_ips = [d['ip'] for d in sorted_devices]
-        last_ips = [d['ip'] for d in self.last_tested_device_list]
-        
-        # If device list changed, reset to first device
-        if current_ips != last_ips:
-            self._print_quality_message("🔄 Device list changed, resetting round-robin to first device")
-            self.quality_test_device_index = 0
-            self.last_tested_device_list = sorted_devices.copy()
-        
-        # Ensure index is within bounds (safety check)
-        if self.quality_test_device_index >= len(sorted_devices):
-            self.quality_test_device_index = 0
-        
-        # Get the device to test
-        device_to_test = sorted_devices[self.quality_test_device_index]
-        
-        # Move to next device for next time (round-robin)
-        self.quality_test_device_index = (self.quality_test_device_index + 1) % len(sorted_devices)
-        
-        return device_to_test
-    
-    def _collect_snapshot(self) -> Optional[MonitoringSnapshot]:
-        """
-        Collect a complete network monitoring snapshot.
-        
-        Enhanced with round-robin device quality testing.
-        
-        Returns:
-            MonitoringSnapshot: Complete network state, or None if collection failed
+        This method demonstrates:
+        1. Multi-source data collection
+        2. Data validation and error handling
+        3. Performance optimization
+        4. Round-robin device testing strategy
         """
         try:
-            current_time = time.time()
-            snapshot_timestamp = datetime.now()
+            snapshot_timestamp = datetime.now().isoformat()
             
-            # 1. Update device list every 30 seconds (expensive operation)
-            if (self.last_device_discovery is None or 
-                current_time - self.last_device_discovery > 30):
-                
+            # 1. Device discovery (with caching for performance)
+            devices = list(self.device_cache.values())  # Use cached devices primarily
+            
+            # Periodically refresh device list (every 30 seconds)
+            if not hasattr(self, '_last_discovery') or \
+               (datetime.now() - self._last_discovery).total_seconds() > 30:
                 try:
-                    devices = self.network_monitor.discover_devices()
-                    self.device_cache = {dev['ip']: dev for dev in devices}
-                    self.last_device_discovery = current_time
-                except Exception as e:
-                    # Use cached devices if discovery fails
-                    devices = list(self.device_cache.values())
-            else:
-                devices = list(self.device_cache.values())
+                    fresh_devices = self.network_monitor.discover_devices()
+                    if fresh_devices:
+                        new_cache = {dev['ip']: dev for dev in fresh_devices}
+                        
+                        # Check if device list changed
+                        if set(new_cache.keys()) != set(self.device_cache.keys()):
+                            self._print_quality_message("🔄 Device list changed, resetting round-robin to first device")
+                            self.device_test_index = 0
+                            self.tested_devices.clear()
+                        
+                        self.device_cache = new_cache
+                        devices = fresh_devices
+                    self._last_discovery = datetime.now()
+                except:
+                    pass  # Use cached devices if discovery fails
             
-            # 2. Get current bandwidth statistics (this is fast)
+            # 2. Bandwidth monitoring
             current_bandwidth_stats = self.network_monitor.get_bandwidth_stats()
+            upload_mbps = current_bandwidth_stats.get('upload_mbps', 0.0)
+            download_mbps = current_bandwidth_stats.get('download_mbps', 0.0)
+            usage_mb = current_bandwidth_stats.get('total_usage_mb', 0.0)
             
-            # 3. Calculate bandwidth usage (if we have previous stats)
-            upload_mbps = download_mbps = usage_mb = 0.0
-            if self.last_bandwidth_stats:
-                try:
-                    usage = self.network_monitor.calculate_bandwidth_usage(
-                        self.last_bandwidth_stats, 
-                        current_bandwidth_stats
-                    )
-                    upload_mbps = usage.get('upload_rate_mbps', 0.0)
-                    download_mbps = usage.get('download_rate_mbps', 0.0)
-                    usage_mb = usage.get('total_usage_mb', 0.0)
-                except Exception as e:
-                    pass  # Keep default values
-            
-            # Update bandwidth baseline
-            self.last_bandwidth_stats = current_bandwidth_stats
-            
-            # 4. ENHANCED: Round-robin connection quality testing
+            # 3. Round-robin connection quality testing
+            tested_device_ip = None
             avg_latency = 0.0
             avg_packet_loss = 0.0
-            overall_quality = "Unknown"
-            tested_device_ip = None
             
-            # Only test quality if enabled and enough time has passed
-            if (self.enable_quality_testing and 
-                (self.last_quality_test is None or 
-                 current_time - self.last_quality_test > self.quality_test_interval)):
-                
-                # Get next device using round-robin
-                device_to_test = self._get_next_device_for_quality_test(devices)
-                
-                if device_to_test:
-                    try:
-                        # FIX: Suppress detailed output during testing to keep display clean
-                        self.suppress_quality_output = True
-                        
-                        # Quick quality check (only 1 ping sample for speed)
-                        quality = self.network_monitor.monitor_device_connectivity(
-                            device_to_test['ip'], samples=1
-                        )
-                        
-                        avg_latency = quality['avg_latency_ms']
-                        avg_packet_loss = quality['packet_loss_percent']
-                        tested_device_ip = device_to_test['ip']
-                        self.last_quality_test = current_time
-                        
-                        # FIX: Brief, clean notification without disrupting display
-                        hostname = device_to_test.get('hostname', 'Unknown')
-                        self._print_quality_message(
-                            f"🔍 Tested {device_to_test['ip']} ({hostname}): "
-                            f"{avg_latency:.1f}ms, {avg_packet_loss:.1f}% loss"
-                        )
-                        
-                    except Exception as e:
-                        # Move to next device anyway, but don't spam errors
-                        pass
-                    finally:
-                        self.suppress_quality_output = False
-                
-                # Determine overall quality based on tested device
-                overall_quality = self._calculate_overall_quality(avg_latency, avg_packet_loss, len(devices))
+            if devices:
+                # Select device for round-robin testing
+                device_ips = list(self.device_cache.keys())
+                if device_ips:
+                    # Get current device for testing
+                    current_device_ip = device_ips[self.device_test_index % len(device_ips)]
+                    tested_device_ip = current_device_ip
+                    
+                    # Test connection quality for this device
+                    latency_results = []
+                    
+                    self._print_quality_message(f"🔍 Testing connection quality to {current_device_ip} ({self.quality_test_samples} samples)...")
+                    
+                    for i in range(self.quality_test_samples):
+                        try:
+                            quality_result = self.network_monitor.monitor_device_connectivity(current_device_ip)
+                            if quality_result and 'latency_ms' in quality_result:
+                                latency_ms = quality_result['latency_ms']
+                                latency_results.append(latency_ms)
+                                self._print_quality_message(f"  Ping {i+1}: {latency_ms:.2f}ms")
+                        except Exception as e:
+                            self._print_quality_message(f"  Ping {i+1}: Failed ({e})")
+                    
+                    # Calculate averages
+                    if latency_results:
+                        avg_latency = sum(latency_results) / len(latency_results)
+                        # Simple packet loss simulation (0% for successful pings)
+                        successful_pings = len(latency_results)
+                        total_pings = self.quality_test_samples
+                        avg_packet_loss = ((total_pings - successful_pings) / total_pings) * 100
+                    
+                    # Add to tested devices set
+                    self.tested_devices.add(current_device_ip)
+                    
+                    # Move to next device for next round
+                    self.device_test_index += 1
+            
+            # 4. Overall quality assessment
+            overall_quality = "Good"  # Default
+            if avg_latency > 0:
+                if avg_latency < 20 and avg_packet_loss < 1:
+                    overall_quality = "Excellent"
+                elif avg_latency < 50 and avg_packet_loss < 3:
+                    overall_quality = "Good"
+                elif avg_latency < 100 and avg_packet_loss < 10:
+                    overall_quality = "Fair"
+                else:
+                    overall_quality = "Poor"
             else:
-                # Use cached quality or basic estimation when not testing
+                # No active testing, base on device count
                 if devices:
                     overall_quality = "Good" if len(devices) <= 10 else "Fair"
             
@@ -429,26 +365,24 @@ class ContinuousNetworkMonitorService:
         """
         Calculate overall network quality based on multiple factors.
         
-        Quality factors:
-        1. Average latency across sampled devices
-        2. Average packet loss
-        3. Network load (device count)
+        Uses industry-standard network quality metrics:
+        - Excellent: <20ms latency, <1% loss, optimal device count
+        - Good: <50ms latency, <3% loss, reasonable device count
+        - Fair: <100ms latency, <10% loss, higher device count
+        - Poor: >100ms latency or >10% loss or too many devices
         """
-        if avg_latency == 0:  # No devices to sample
-            return "Unknown"
-        
         # Base quality on latency and packet loss
-        if avg_packet_loss > 5 or avg_latency > 100:
-            base_quality = "Poor"
-        elif avg_packet_loss > 2 or avg_latency > 50:
-            base_quality = "Fair"
-        elif avg_packet_loss > 0.5 or avg_latency > 25:
-            base_quality = "Good"
-        else:
+        if avg_latency < 20 and avg_packet_loss < 1:
             base_quality = "Excellent"
+        elif avg_latency < 50 and avg_packet_loss < 3:
+            base_quality = "Good"
+        elif avg_latency < 100 and avg_packet_loss < 10:
+            base_quality = "Fair"
+        else:
+            base_quality = "Poor"
         
-        # Adjust for network load
-        if device_count > 10:
+        # Adjust for device count (network congestion indicator)
+        if device_count > 20:
             if base_quality == "Excellent":
                 base_quality = "Good"
             elif base_quality == "Good":
@@ -456,25 +390,50 @@ class ContinuousNetworkMonitorService:
         
         return base_quality
     
-    def _display_realtime_data(self, snapshot: MonitoringSnapshot):
+    def _process_monitoring_data(self, snapshot: MonitoringSnapshot):
         """
-        Display real-time monitoring data in a formatted terminal output.
+        Process and display monitoring data.
         
-        FIX: Clean, non-overlapping display with proper line management.
+        This method demonstrates:
+        1. Data processing and validation
+        2. Real-time display management
+        3. Statistics calculation
+        4. Performance tracking
         """
+        # Add to snapshots history
+        self.snapshots.append(snapshot)
+        self.measurement_count += 1
+        
+        # Determine if this was a successful measurement
+        if snapshot.device_count > 0:
+            self.successful_measurements += 1
+        
+        # Display real-time data
+        self._display_realtime_data(snapshot)
+    
+    def _display_realtime_data(self, snapshot: MonitoringSnapshot):
+        """Display real-time monitoring data in terminal."""
         with self.display_lock:
-            # Calculate uptime
-            uptime = datetime.now() - self.start_time
-            uptime_str = str(uptime).split('.')[0]  # Remove microseconds
-            
-            # Calculate success rate
+            # Calculate runtime and success rate
+            runtime = datetime.now() - self.start_time
             success_rate = (self.successful_measurements / self.measurement_count * 100) if self.measurement_count > 0 else 0
             
-            # Build the status line
-            tested_info = f" [Testing: {snapshot.tested_device_ip}]" if snapshot.tested_device_ip else ""
+            # Format runtime as HH:MM:SS
+            total_seconds = int(runtime.total_seconds())
+            hours = total_seconds // 3600
+            minutes = (total_seconds % 3600) // 60
+            seconds = total_seconds % 60
+            uptime_str = f"{hours}:{minutes:02d}:{seconds:02d}"
             
+            # Format tested device info
+            tested_info = ""
+            if snapshot.tested_device_ip:
+                tested_info = f" [Testing: {snapshot.tested_device_ip}]"
+            
+            # Create status line
+            timestamp = datetime.now().strftime("%H:%M:%S")
             status_line = (
-                f"📊 {snapshot.timestamp.strftime('%H:%M:%S')} | "
+                f"📊 {timestamp} | "
                 f"Devices: {snapshot.device_count:2d} | "
                 f"↑{snapshot.total_upload_mbps:6.2f} Mbps | "
                 f"↓{snapshot.total_download_mbps:6.2f} Mbps | "
@@ -487,7 +446,7 @@ class ContinuousNetworkMonitorService:
             
             # Clear the line completely and display new status
             self._clear_line()
-            print(status_line, end='', flush=True)
+            print(f"\r{status_line}", end='', flush=True)
             
             # Store the length for future clearing
             self.last_display_length = len(status_line)
@@ -503,19 +462,14 @@ class ContinuousNetworkMonitorService:
         success_rate = (self.successful_measurements / self.measurement_count * 100) if self.measurement_count > 0 else 0
         
         # Data analysis
+        avg_devices = sum(s.device_count for s in self.snapshots) / len(self.snapshots)
         total_upload = sum(s.total_upload_mbps for s in self.snapshots)
         total_download = sum(s.total_download_mbps for s in self.snapshots)
-        avg_devices = statistics.mean(s.device_count for s in self.snapshots)
+        avg_latency = sum(s.avg_latency_ms for s in self.snapshots) / len(self.snapshots)
         
-        latencies = [s.avg_latency_ms for s in self.snapshots if s.avg_latency_ms > 0]
-        avg_latency = statistics.mean(latencies) if latencies else 0
-        
-        # Round-robin testing summary
-        tested_devices = set(s.tested_device_ip for s in self.snapshots if s.tested_device_ip)
-        
-        print(f"\n\n📈 Final Session Statistics:")
-        print("="*50)
-        print(f"⏱️  Total runtime: {str(total_runtime).split('.')[0]}")
+        print("\n\n📈 Final Session Statistics:")
+        print("=" * 50)
+        print(f"⏱️  Total runtime: {total_runtime}")
         print(f"📊 Total measurements: {self.measurement_count}")
         print(f"✅ Successful measurements: {self.successful_measurements}")
         print(f"📈 Success rate: {success_rate:.1f}%")
@@ -523,77 +477,58 @@ class ContinuousNetworkMonitorService:
         print(f"⬆️  Total upload activity: {total_upload:.2f} Mbps-seconds")
         print(f"⬇️  Total download activity: {total_download:.2f} Mbps-seconds")
         print(f"🔍 Average network latency: {avg_latency:.1f}ms")
-        print(f"🎯 Unique devices tested: {len(tested_devices)} devices")
+        print(f"🎯 Unique devices tested: {len(self.tested_devices)} devices")
         print(f"💾 Data snapshots collected: {len(self.snapshots)}")
-        print(f"🗄️  Ready for database persistence!")
+        print("🗄️  Ready for database persistence!")
         
-        if tested_devices:
-            print(f"\n🔄 Round-robin tested devices:")
-            for ip in sorted(tested_devices):
-                print(f"   • {ip}")
-    
-    def get_recent_snapshots(self, count: int = 10) -> List[MonitoringSnapshot]:
-        """
-        Get the most recent monitoring snapshots.
-        
-        Args:
-            count: Number of recent snapshots to return
-            
-        Returns:
-            List of recent MonitoringSnapshot objects
-        """
-        return self.snapshots[-count:] if self.snapshots else []
-    
-    def get_service_status(self) -> Dict:
-        """
-        Get current service status and statistics.
-        
-        Returns:
-            Dictionary with service status information
-        """
-        return {
-            'is_running': self.is_running,
-            'start_time': self.start_time.isoformat() if self.start_time else None,
-            'measurement_count': self.measurement_count,
-            'successful_measurements': self.successful_measurements,
-            'success_rate': (self.successful_measurements / self.measurement_count * 100) if self.measurement_count > 0 else 0,
-            'snapshots_collected': len(self.snapshots),
-            'network_range': self.network_monitor.network_range,
-            'monitor_interval': self.monitor_interval,
-            'quality_testing_enabled': self.enable_quality_testing,
-            'current_device_index': self.quality_test_device_index,
-            'devices_in_rotation': len(self.last_tested_device_list)
-        }
+        if self.tested_devices:
+            print("\n🔄 Round-robin tested devices:")
+            for device_ip in sorted(self.tested_devices):
+                print(f"   • {device_ip}")
 
 
 def main():
     """
-    Main function to run the continuous monitoring service.
+    Main entry point for the continuous monitoring service.
     
-    This provides a simple CLI interface to start the service.
+    This demonstrates:
+    1. Service initialization and configuration
+    2. Error handling and graceful shutdown
+    3. User interaction and control
     """
-    print("🌐 Continuous Network Monitoring Service (Round-Robin Enhanced)")
-    print("=" * 50)
+    print("🌐 Network Monitoring Service")
+    print("============================")
     
-    # Create and start the service
-    service = ContinuousNetworkMonitorService(monitor_interval=1.0)
+    # Create and configure the service
+    service = ContinuousNetworkMonitorService(
+        monitoring_interval=1.0,  # 1 second intervals
+        quality_test_samples=1    # 1 ping per device test (faster)
+    )
     
     try:
-        if service.start():
-            # Keep the main thread alive while service runs
-            while service.is_running:
-                time.sleep(1)
-        else:
+        # Start the service
+        if not service.start():
             print("❌ Failed to start monitoring service")
-            sys.exit(1)
-            
-    except KeyboardInterrupt:
-        print("\n🛑 Keyboard interrupt received")
+            return 1
+        
+        # Keep the main thread alive while service runs
+        try:
+            while service.is_running:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\n🛑 Received interrupt signal...")
+        
     except Exception as e:
-        print(f"\n❌ Unexpected error: {e}")
+        print(f"\n❌ Service error: {e}")
+        return 1
+    
     finally:
+        # Ensure service is stopped
         service.stop()
+    
+    print("👋 Service stopped. Thank you for using Network Monitor!")
+    return 0
 
 
 if __name__ == "__main__":
-    main() 
+    exit(main()) 

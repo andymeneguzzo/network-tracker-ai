@@ -150,8 +150,8 @@ class DatabaseIntegrationTest:
                         self.session_id, snapshot_data
                     )
                     
-                    # Save discovered devices
-                    for device in self.device_cache.values():
+                    # Save discovered devices from the snapshot
+                    for device in snapshot.devices:
                         self.db_manager.save_device(device)
                     
                     # Save quality test result if we tested a device
