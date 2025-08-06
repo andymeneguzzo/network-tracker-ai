@@ -94,7 +94,11 @@ cd network-tracker-ai
 chmod +x setup_continuous_monitor.sh
 ./setup_continuous_monitor.sh
 
-# Or run the AI insights analysis
+# Generate realistic data for AI analysis demo
+chmod +x setup_realistic_data.sh
+./setup_realistic_data.sh
+
+# Run the AI insights analysis
 chmod +x setup_ai_insights.sh
 ./setup_ai_insights.sh
 ```
@@ -104,9 +108,12 @@ chmod +x setup_ai_insights.sh
 2. Install all dependencies (including AI/ML packages)
 3. Run comprehensive tests with success rate calculation
 4. Start the monitoring service with live demo
-5. Generate AI-powered insights and reports
+5. Generate realistic network data for AI analysis
+6. Run AI-powered insights and reports
 
 You'll see real-time network statistics and AI-generated insights about your network patterns! 📊
+
+**Note**: The `setup_realistic_data.sh` script generates 3 days of realistic network monitoring data (8,640 data points) that mimics real household usage patterns. This provides the AI system with sufficient data to demonstrate pattern recognition, peak hour detection, and optimization recommendations.
 
 ---
 
