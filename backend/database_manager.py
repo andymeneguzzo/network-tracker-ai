@@ -274,24 +274,47 @@ class NetworkDatabaseManager:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             
-            cursor.execute("""
-                INSERT INTO network_snapshots (
-                    session_id, device_count, total_upload_mbps, total_download_mbps,
-                    total_usage_mb, avg_latency_ms, avg_packet_loss, overall_quality,
-                    active_interfaces, tested_device_ip
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                session_id,
-                snapshot_data['device_count'],
-                snapshot_data['total_upload_mbps'],
-                snapshot_data['total_download_mbps'],
-                snapshot_data['total_usage_mb'],
-                snapshot_data['avg_latency_ms'],
-                snapshot_data['avg_packet_loss'],
-                snapshot_data['overall_quality'],
-                json.dumps(snapshot_data['active_interfaces']),
-                snapshot_data.get('tested_device_ip')
-            ))
+            # FIXED: Include timestamp in INSERT if provided, otherwise use CURRENT_TIMESTAMP
+            if 'timestamp' in snapshot_data:
+                cursor.execute("""
+                    INSERT INTO network_snapshots (
+                        session_id, timestamp, device_count, total_upload_mbps, total_download_mbps,
+                        total_usage_mb, avg_latency_ms, avg_packet_loss, overall_quality,
+                        active_interfaces, tested_device_ip
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    session_id,
+                    snapshot_data['timestamp'],  # FIXED: Use provided timestamp
+                    snapshot_data['device_count'],
+                    snapshot_data['total_upload_mbps'],
+                    snapshot_data['total_download_mbps'],
+                    snapshot_data['total_usage_mb'],
+                    snapshot_data['avg_latency_ms'],
+                    snapshot_data['avg_packet_loss'],
+                    snapshot_data['overall_quality'],
+                    json.dumps(snapshot_data['active_interfaces']),
+                    snapshot_data.get('tested_device_ip')
+                ))
+            else:
+                # Original behavior for real-time monitoring
+                cursor.execute("""
+                    INSERT INTO network_snapshots (
+                        session_id, device_count, total_upload_mbps, total_download_mbps,
+                        total_usage_mb, avg_latency_ms, avg_packet_loss, overall_quality,
+                        active_interfaces, tested_device_ip
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    session_id,
+                    snapshot_data['device_count'],
+                    snapshot_data['total_upload_mbps'],
+                    snapshot_data['total_download_mbps'],
+                    snapshot_data['total_usage_mb'],
+                    snapshot_data['avg_latency_ms'],
+                    snapshot_data['avg_packet_loss'],
+                    snapshot_data['overall_quality'],
+                    json.dumps(snapshot_data['active_interfaces']),
+                    snapshot_data.get('tested_device_ip')
+                ))
             
             snapshot_id = cursor.lastrowid
             conn.commit()

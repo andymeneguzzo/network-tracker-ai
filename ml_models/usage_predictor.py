@@ -151,10 +151,27 @@ class NetworkUsagePredictor:
                 end_time.isoformat()
             ])
         
-        # Convert timestamp columns to datetime
-        df['hour_start'] = pd.to_datetime(df['hour_start'])
-        df['hour_end'] = pd.to_datetime(df['hour_end'])
-        df['date'] = pd.to_datetime(df['date'])
+        # FIXED: Handle mixed timestamp formats gracefully
+        try:
+            # Try to parse timestamps with flexible format handling
+            df['hour_start'] = pd.to_datetime(df['hour_start'], format='mixed', errors='coerce')
+            df['hour_end'] = pd.to_datetime(df['hour_end'], format='mixed', errors='coerce')
+            df['date'] = pd.to_datetime(df['date'], format='mixed', errors='coerce')
+            
+            # Remove any rows where timestamp parsing failed
+            df = df.dropna(subset=['hour_start', 'hour_end', 'date'])
+            
+        except Exception as e:
+            print(f"⚠️  Timestamp parsing warning: {e}")
+            # Fallback: try with ISO format
+            try:
+                df['hour_start'] = pd.to_datetime(df['hour_start'], format='ISO8601', errors='coerce')
+                df['hour_end'] = pd.to_datetime(df['hour_end'], format='ISO8601', errors='coerce')
+                df['date'] = pd.to_datetime(df['date'], format='ISO8601', errors='coerce')
+                df = df.dropna(subset=['hour_start', 'hour_end', 'date'])
+            except Exception as e2:
+                print(f"❌ Timestamp parsing failed: {e2}")
+                return pd.DataFrame()  # Return empty DataFrame
         
         print(f"📊 Fetched {len(df)} hourly data points for analysis")
         return df
